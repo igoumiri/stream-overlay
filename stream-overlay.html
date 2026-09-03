@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Real Good AI — Stream Overlay</title>
+<style>
+  /* ============================================================
+     TRANSPARENT CANVAS
+     This page is meant to be added as a Browser Source in OBS /
+     Streamlabs / etc. html/body must stay fully transparent —
+     the overlay only ever draws two floating elements on top of
+     whatever the stream shows underneath.
+     ============================================================ */
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  /* ── Setup hint — only ever shown when the page is opened with no
+       config at all (e.g. someone opens the raw file directly). Never
+       shown once real query params are present, so it can't leak onto
+       a live stream from a typo in one param. ── */
+  .ov-setup-hint {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2em;
+  }
+  .ov-setup-hint-card {
+    max-width: 460px;
+    background: rgba(17,17,17,0.92);
+    color: #fff;
+    border-radius: 14px;
+    padding: 1.6em 1.8em;
+    font-size: 14px;
+    line-height: 1.6;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+  .ov-setup-hint-card h1 { font-size: 1.05rem; margin: 0 0 0.5em; }
+  .ov-setup-hint-card code {
+    background: rgba(255,255,255,0.12);
+    padding: 0.1em 0.4em;
+    border-radius: 4px;
+    font-size: 12.5px;
+    word-break: break-all;
+  }
+
+  /* ── Debug strip — only rendered with ?debug=1 ── */
+  .ov-debug {
+    position: fixed;
+    left: 8px;
+    bottom: 8px;
+    max-width: 46vw;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10px;
+    line-height: 1.5;
+    color: rgba(255,255,255,0.65);
+    background: rgba(0,0,0,0.55);
+    padding: 6px 8px;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    z-index: 9999;
+  }
+
+  /* ── Bulb widget anchor ──
+     Positioning lives on the outer anchor; scale lives on a middle
+     wrapper (with a transform-origin matching the anchored corner, so
+     it grows away from the edge it's pinned to, not off-screen); the
+     wiggle animation lives on the innermost wrapper, so scale and
+     wiggle transforms never fight each other on the same element. */
+  .bulb-anchor {
+    position: fixed;
+    margin: 0;
+  }
+  .bulb-anchor.pos-top-left     { top: 28px; left: 28px; }
+  .bulb-anchor.pos-top-right    { top: 28px; right: 28px; }
+  .bulb-anchor.pos-bottom-left  { bottom: 28px; left: 28px; }
+  .bulb-anchor.pos-bottom-right { bottom: 28px; right: 28px; }
+  .bulb-anchor.pos-center       { top: 50%; left: 50%; }
+  .bulb-anchor.pos-hidden       { display: none; }
+
+  .bulb-scale-wrap { transition: transform 0.2s ease; }
+  .pos-top-left     .bulb-scale-wrap { transform-origin: top left; }
+  .pos-top-right    .bulb-scale-wrap { transform-origin: top right; }
+  .pos-bottom-left  .bulb-scale-wrap { transform-origin: bottom left; }
+  .pos-bottom-right .bulb-scale-wrap { transform-origin: bottom right; }
+  .pos-center       .bulb-scale-wrap { transform-origin: center; transform: translate(-50%, -50%) scale(var(--ov-scale, 1)); }
+  .pos-top-left     .bulb-scale-wrap,
+  .pos-top-right    .bulb-scale-wrap,
+  .pos-bottom-left  .bulb-scale-wrap,
+  .pos-bottom-right .bulb-scale-wrap { transform: scale(var(--ov-scale, 1)); }
+
+  @keyframes bulb-wiggle {
+    0%, 100% { transform: rotate(0deg); }
+    20% { transform: rotate(-7deg); }
+    40% { transform: rotate(6deg); }
+    60% { transform: rotate(-4deg); }
+    80% { transform: rotate(2deg); }
+  }
+  .bulb-wiggle-wrap.wiggling { animation: bulb-wiggle 0.6s ease; }
+
+  .bulb-card { width: 220px; text-align: center; }
+  .bulb-card svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .bulb-caption { margin-top: 6px; font-size: 13px; font-weight: 700; color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,0.7), 0 0 12px rgba(0,0,0,0.5); }
+  .bulb-caption .bulb-pct { color: #f9c116; }
+  .bulb-subcaption { font-size: 11px; color: rgba(255,255,255,0.85); font-weight: 600; text-shadow: 0 1px 3px rgba(0,0,0,0.7), 0 0 10px rgba(0,0,0,0.5); }
+
+  @keyframes bulb-wave-scroll-a { from { transform: translateX(0); } to { transform: translateX(-100px); } }
+  @keyframes bulb-wave-scroll-b { from { transform: translateX(0); } to { transform: translateX(85px); } }
+  .bulb-wave-layer-a { animation: bulb-wave-scroll-a 3.4s linear infinite; }
+  .bulb-wave-layer-b { animation: bulb-wave-scroll-b 5s linear infinite; }
+  .bulb-liquid-level { transition: transform 1.1s cubic-bezier(0.4, 0, 0.2, 1); }
+
+  /* ── Donation toasts ──
+     Newest toast is always inserted nearest the anchored edge; older
+     ones get pushed away from it. Anchoring the container (rather than
+     each toast) to a corner means this works identically for every
+     position without direction-specific slide animations. */
+  .toast-container {
+    position: fixed;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 380px;
+    z-index: 10000;
+    pointer-events: none;
+  }
+  .toast-container.pos-top-left      { top: 28px; left: 28px; align-items: flex-start; }
+  .toast-container.pos-top-right     { top: 28px; right: 28px; align-items: flex-end; }
+  .toast-container.pos-bottom-left   { bottom: 28px; left: 28px; align-items: flex-start; flex-direction: column-reverse; }
+  .toast-container.pos-bottom-right  { bottom: 28px; right: 28px; align-items: flex-end; flex-direction: column-reverse; }
+  .toast-container.pos-top-center    { top: 28px; left: 50%; transform: translateX(-50%); align-items: center; }
+  .toast-container.pos-bottom-center { bottom: 28px; left: 50%; transform: translateX(-50%); align-items: center; flex-direction: column-reverse; }
+
+  .sb-toast {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 18px 12px 14px;
+    border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35), 0 2px 8px rgba(0,0,0,0.25);
+    animation: toast-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    max-width: 380px;
+  }
+  .sb-toast.leaving { animation: toast-out 0.3s ease forwards; }
+
+  .sb-toast.theme-dark {
+    background: rgba(17,17,17,0.88);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #fff;
+  }
+  .sb-toast.theme-light {
+    background: rgba(255,255,255,0.94);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(0,0,0,0.06);
+    color: #16324a;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.18), 0 2px 8px rgba(0,0,0,0.1);
+  }
+
+  .sb-toast-icon {
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    background: linear-gradient(135deg, #f9c116, #d9971f);
+  }
+  .sb-toast-text { min-width: 0; }
+  .sb-toast-name {
+    font-size: 14px;
+    font-weight: 800;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    letter-spacing: -0.01em;
+  }
+  .sb-toast-amount { font-size: 13px; font-weight: 600; opacity: 0.9; }
+  .theme-dark .sb-toast-amount { color: #6ee7b7; }
+  .theme-light .sb-toast-amount { color: #059669; }
+  .sb-toast-recur {
+    display: inline-block;
+    margin-left: 4px;
+    font-size: 11px;
+    opacity: 0.75;
+  }
+
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(10px) scale(0.92); }
+    to   { opacity: 1; transform: none; }
+  }
+  @keyframes toast-out {
+    from { opacity: 1; transform: none; }
+    to   { opacity: 0; transform: scale(0.92); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bulb-wiggle-wrap.wiggling { animation: none; }
+    .sb-toast, .sb-toast.leaving { animation: none; }
+    .bulb-wave-layer-a, .bulb-wave-layer-b { animation: none; }
+  }
+</style>
+</head>
+<body>
+
+<div id="ov-setup-hint" class="ov-setup-hint" style="display:none;">
+  <div class="ov-setup-hint-card">
+    <h1>Stream overlay — no config found</h1>
+    <p>This page is meant to be opened with query parameters, e.g. from the "Stream overlay" button on a campaign page. At minimum it needs:</p>
+    <p><code>?slug=YOUR-CAMPAIGN&supabaseUrl=...&supabaseAnonKey=...</code></p>
+    <p>This hint only appears when no parameters are present at all — it won't show once the overlay is configured, even if a value is wrong.</p>
+  </div>
+</div>
+
+<div id="ov-debug" class="ov-debug" style="display:none;"></div>
+
+<div id="bulb-anchor" class="bulb-anchor pos-bottom-right">
+  <div id="bulb-scale-wrap" class="bulb-scale-wrap">
+    <div id="bulb-wiggle-wrap" class="bulb-wiggle-wrap">
+      <div class="bulb-card">
+        <svg viewBox="695 210 530 670" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <clipPath id="ov-glass-clip">
+              <path d="M969.3,323.59
+                       C909.18,322.01 849.57,351.95 820.65,405.83
+                       C803.26,438.23 798.95,476.38 806.89,512.13
+                       C814.98,548.59 838.86,580.47 857.16,612.51
+                       C871.27,637.2 893.02,670.3 890.09,699.66
+                       C887.69,723.67 890.09,734.07 908.49,736.47
+                       L1030.29,736.49
+                       C1048.69,734.09 1051.09,723.69 1048.69,699.68
+                       C1045.76,670.32 1067.51,637.22 1081.62,612.53
+                       C1099.93,580.49 1123.81,548.61 1131.89,512.15
+                       C1135.96,493.8 1136.81,474.83 1134.32,456.32
+                       C1140,420 1120,390 1093.88,372.75
+                       C1061.96,339.92 1015.88,322.37 969.49,323.59 Z" />
+            </clipPath>
+          </defs>
+          <path d="M908.49,736.47 L908.49,805.28
+                   C908.49,805.28 910.89,825.68 928.89,825.68
+                   L946.89,825.68 L946.89,851.69
+                   C946.89,854.01 948.77,855.88 951.08,855.88
+                   L987.7,855.88
+                   C990.02,855.88 991.89,854.0 991.89,851.69
+                   L991.89,825.7 L1009.89,825.7
+                   C1027.89,825.7 1030.29,805.3 1030.29,805.3
+                   L1030.29,736.49 L908.49,736.47 Z" fill="#b8b8b9" />
+          <path d="M969.3,323.59
+                   C909.18,322.01 849.57,351.95 820.65,405.83
+                   C803.26,438.23 798.95,476.38 806.89,512.13
+                   C814.98,548.59 838.86,580.47 857.16,612.51
+                   C871.27,637.2 893.02,670.3 890.09,699.66
+                   C887.69,723.67 890.09,734.07 908.49,736.47
+                   L1030.29,736.49
+                   C1048.69,734.09 1051.09,723.69 1048.69,699.68
+                   C1045.76,670.32 1067.51,637.22 1081.62,612.53
+                   C1099.93,580.49 1123.81,548.61 1131.89,512.15
+                   C1135.96,493.8 1136.81,474.83 1134.32,456.32
+                   C1140,420 1120,390 1093.88,372.75
+                   C1061.96,339.92 1015.88,322.37 969.49,323.59 Z" fill="#fff6da" />
+          <g clip-path="url(#ov-glass-clip)">
+            <g id="ov-liquid-level" class="bulb-liquid-level" style="transform: translateY(736px);">
+              <g class="bulb-wave-layer-b">
+                <path fill="#ffd23f" opacity="0.6" d="M 600,3 Q 621.25,-3 642.5,3 Q 663.75,9 685,3 Q 706.25,-3 727.5,3 Q 748.75,9 770,3 Q 791.25,-3 812.5,3 Q 833.75,9 855,3 Q 876.25,-3 897.5,3 Q 918.75,9 940,3 Q 961.25,-3 982.5,3 Q 1003.75,9 1025,3 Q 1046.25,-3 1067.5,3 Q 1088.75,9 1110,3 Q 1131.25,-3 1152.5,3 Q 1173.75,9 1195,3 Q 1216.25,-3 1237.5,3 Q 1258.75,9 1280,3 Q 1301.25,-3 1322.5,3 Q 1343.75,9 1365,3 Q 1386.25,-3 1407.5,3 Q 1428.75,9 1450,3 Q 1471.25,-3 1492.5,3 Q 1513.75,9 1535,3 L 1535,470 L 600,470 Z" />
+              </g>
+              <g class="bulb-wave-layer-a">
+                <path fill="#f9c116" d="M 600,0 Q 625,9 650,0 Q 675,-9 700,0 Q 725,9 750,0 Q 775,-9 800,0 Q 825,9 850,0 Q 875,-9 900,0 Q 925,9 950,0 Q 975,-9 1000,0 Q 1025,9 1050,0 Q 1075,-9 1100,0 Q 1125,9 1150,0 Q 1175,-9 1200,0 Q 1225,9 1250,0 Q 1275,-9 1300,0 Q 1325,9 1350,0 Q 1375,-9 1400,0 Q 1425,9 1450,0 Q 1475,-9 1500,0 Q 1525,9 1550,0 Q 1575,-9 1600,0 L 1600,450 L 600,450 Z" />
+              </g>
+            </g>
+          </g>
+          <path d="M969.3,323.59c-60.12-1.58-119.73,28.36-148.65,82.24-17.39,32.4-21.7,70.55-13.76,106.3,8.09,36.46,31.97,68.34,50.27,100.38,14.11,24.69,35.86,57.79,32.93,87.15-2.4,24.01,0,34.41,18.4,36.81v68.81s2.4,20.4,20.4,20.4h18v26.01c0,2.32,1.88,4.19,4.19,4.19h36.62c2.32,0,4.19-1.88,4.19-4.19v-25.99h18c18,0,20.4-20.4,20.4-20.4v-68.81c18.4-2.4,20.8-12.8,18.4-36.81-2.93-29.36,18.82-62.46,32.93-87.15,18.31-32.04,42.19-63.92,50.27-100.38,4.07-18.35,4.92-37.32,2.43-55.83" fill="none" stroke="#000" stroke-width="16.76" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M1093.88,372.75c-31.92-32.83-78-50.38-124.39-49.16" fill="none" stroke="#000" stroke-width="16.76" stroke-linecap="round" stroke-linejoin="round" />
+          <line x1="908.49" y1="736.48" x2="1030.3" y2="736.48" stroke="#000" stroke-width="16.76" stroke-linecap="round" />
+          <line x1="975.63" y1="782.61" x2="1030.3" y2="782.61" stroke="#000" stroke-width="16.76" stroke-linecap="round" />
+          <line x1="908.49" y1="782.61" x2="945.75" y2="782.61" stroke="#000" stroke-width="16.76" stroke-linecap="round" />
+          <line x1="946.9" y1="825.7" x2="1007.04" y2="825.7" stroke="#000" stroke-width="16.76" stroke-linecap="round" />
+          <circle cx="1121" cy="411.49" r="9.82" />
+          <g>
+            <path stroke="#000" stroke-width="13.97" stroke-miterlimit="10" d="M929.86,451.27c2.25-.67,4.72-1.01,7.42-1.01h.17c7.53,0,13.69,4.47,18.47,13.41,4.78,8.94,9.08,23.98,12.9,45.12,3.37,18.55,5.06,29.51,5.06,32.89,0,3.71-1.07,6.75-3.21,9.11s-4.67,3.54-7.59,3.54c-2.36,0-4.61-.9-6.75-2.7-2.25-2.02-3.99-4.69-5.23-8.01-1.24-3.31-2.59-8.97-4.05-16.95-.23-1.46-.51-3.12-.84-4.98-.34-1.85-.62-3.23-.84-4.13l-.17-1.35c0-.11-.17-.17-.51-.17-1.35,0-5.93,1.52-13.75,4.56-7.82,3.03-12,4.61-12.56,4.72-1.8.45-2.87.82-3.2,1.1-.34.28-.62,1.15-.84,2.61-1.01,8.88-1.91,14.87-2.7,17.96-.79,3.1-2.14,5.65-4.05,7.67-1.69,1.8-3.43,2.7-5.23,2.7-3.94,0-6.58-2.64-7.93-7.93-1.13-4.27-1.69-11.02-1.69-20.24,0-2.47.11-6.3.34-11.47,1.91-27.32,8.88-46.32,20.91-57.01,4.96-4.49,10.25-7.64,15.87-9.44ZM936.27,477.07c-.9-1.69-1.58-2.53-2.02-2.53-.67,0-2.31,1.18-4.89,3.54-2.7,2.36-4.84,5.29-6.41,8.77-1.13,2.47-2.31,5.71-3.54,9.7-1.24,3.99-1.85,6.61-1.85,7.84,0,.34.05.51.17.51l8.77-4.72c5.96-3.26,10.17-4.89,12.65-4.89,1.24,0,1.86-.34,1.86-1.01,0-1.01-.62-3.82-1.86-8.43-1.25-4.62-2.21-7.54-2.88-8.78Z" />
+            <path stroke="#000" stroke-width="13.97" stroke-miterlimit="10" d="M1026.67,456.33c2.7-.79,5.34-1.18,7.93-1.18,3.37,0,6.1.79,8.18,2.36,2.08,1.57,3.12,3.82,3.12,6.75,0,5.73-5.34,10.12-16.02,13.15-.56.23-1.18.45-1.85.67-.67.23-1.21.4-1.6.51-.4.11-.82.25-1.27.42-.45.17-.76.34-.93.51s-.25.37-.25.59c0,2.81.53,10.49,1.6,23.02,1.07,12.54,1.88,20.72,2.45,24.54l.84,5.73,4.22.51c3.6.45,6.46,1.63,8.6,3.54,2.13,1.91,3.2,4.05,3.2,6.41,0,1.8-.56,3.49-1.69,5.06-2.02,3.04-7.14,5.51-15.35,7.42-4.72,1.01-10.23,2.59-16.53,4.72-8.77,2.92-15.46,4.38-20.07,4.38-5.29,0-8.77-1.91-10.46-5.73-.56-1.35-.84-2.3-.84-2.87,0-.22.22-1.12.68-2.7.67-1.91,1.88-3.43,3.63-4.55,1.74-1.12,5.2-2.59,10.37-4.39,4.72-1.69,8.09-3.04,10.12-4.05.68-.45,1.07-.81,1.18-1.09s-.06-.87-.51-1.77c-2.7-5.4-4.05-19.11-4.05-41.15v-14.34l-3.37.51c-5.51.79-11.36,1.18-17.54,1.18-1.58,0-2.53-.06-2.87-.17-3.71-1.24-5.56-3.6-5.56-7.08,0-2.81.95-4.95,2.87-6.41,1.91-1.46,5.96-3.09,12.14-4.89,2.47-.67,9.19-2.3,20.15-4.89,10.96-2.59,17.45-4.16,19.48-4.72Z" />
+          </g>
+          <g fill="#fff">
+            <path d="M929.86,451.27c2.25-.67,4.72-1.01,7.42-1.01h.17c7.53,0,13.69,4.47,18.47,13.41,4.78,8.94,9.08,23.98,12.9,45.12,3.37,18.55,5.06,29.51,5.06,32.89,0,3.71-1.07,6.75-3.21,9.11s-4.67,3.54-7.59,3.54c-2.36,0-4.61-.9-6.75-2.7-2.25-2.02-3.99-4.69-5.23-8.01-1.24-3.31-2.59-8.97-4.05-16.95-.23-1.46-.51-3.12-.84-4.98-.34-1.85-.62-3.23-.84-4.13l-.17-1.35c0-.11-.17-.17-.51-.17-1.35,0-5.93,1.52-13.75,4.56-7.82,3.03-12,4.61-12.56,4.72-1.8.45-2.87.82-3.2,1.1-.34.28-.62,1.15-.84,2.61-1.01,8.88-1.91,14.87-2.7,17.96-.79,3.1-2.14,5.65-4.05,7.67-1.69,1.8-3.43,2.7-5.23,2.7-3.94,0-6.58-2.64-7.93-7.93-1.13-4.27-1.69-11.02-1.69-20.24,0-2.47.11-6.3.34-11.47,1.91-27.32,8.88-46.32,20.91-57.01,4.96-4.49,10.25-7.64,15.87-9.44ZM936.27,477.07c-.9-1.69-1.58-2.53-2.02-2.53-.67,0-2.31,1.18-4.89,3.54-2.7,2.36-4.84,5.29-6.41,8.77-1.13,2.47-2.31,5.71-3.54,9.7-1.24,3.99-1.85,6.61-1.85,7.84,0,.34.05.51.17.51l8.77-4.72c5.96-3.26,10.17-4.89,12.65-4.89,1.24,0,1.86-.34,1.86-1.01,0-1.01-.62-3.82-1.86-8.43-1.25-4.62-2.21-7.54-2.88-8.78Z" />
+            <path d="M1026.67,456.33c2.7-.79,5.34-1.18,7.93-1.18,3.37,0,6.1.79,8.18,2.36,2.08,1.57,3.12,3.82,3.12,6.75,0,5.73-5.34,10.12-16.02,13.15-.56.23-1.18.45-1.85.67-.67.23-1.21.4-1.6.51-.4.11-.82.25-1.27.42-.45.17-.76.34-.93.51s-.25.37-.25.59c0,2.81.53,10.49,1.6,23.02,1.07,12.54,1.88,20.72,2.45,24.54l.84,5.73,4.22.51c3.6.45,6.46,1.63,8.6,3.54,2.13,1.91,3.2,4.05,3.2,6.41,0,1.8-.56,3.49-1.69,5.06-2.02,3.04-7.14,5.51-15.35,7.42-4.72,1.01-10.23,2.59-16.53,4.72-8.77,2.92-15.46,4.38-20.07,4.38-5.29,0-8.77-1.91-10.46-5.73-.56-1.35-.84-2.3-.84-2.87,0-.22.22-1.12.68-2.7.67-1.91,1.88-3.43,3.63-4.55,1.74-1.12,5.2-2.59,10.37-4.39,4.72-1.69,8.09-3.04,10.12-4.05.68-.45,1.07-.81,1.18-1.09s-.06-.87-.51-1.77c-2.7-5.4-4.05-19.11-4.05-41.15v-14.34l-3.37.51c-5.51.79-11.36,1.18-17.54,1.18-1.58,0-2.53-.06-2.87-.17-3.71-1.24-5.56-3.6-5.56-7.08,0-2.81.95-4.95,2.87-6.41,1.91-1.46,5.96-3.09,12.14-4.89,2.47-.67,9.19-2.3,20.15-4.89,10.96-2.59,17.45-4.16,19.48-4.72Z" />
+          </g>
+          <g>
+            <path d="M711.69,406.4c.18-3.84,1.79-9.38,4.85-16.64,2.83-6.12,6.62-10.13,11.39-12.04,3.9-1.45,7.14-1.63,9.72-.54.14.06.38.19.72.38.34.2.62.34.83.43,4.3,2.22,7.39,6.5,9.27,12.85l1.41,4.76,8.84-4.77c11.93-6.3,19.05-9.59,21.35-9.85,1.12-.25,2.54-.01,4.26.71,2.44,1.03,3.1,3.36,1.99,7.01-.07.18-.16.42-.25.74-.09.32-.16.53-.2.61-.52,1.23-1.64,2.71-3.39,4.44-1.34,1.39-2.98,2.68-4.92,3.87s-6,3.42-12.18,6.69c-9.87,5.22-15.01,8.3-15.41,9.26-.11.26-.09.42.05.48.57.24,2.28.7,5.11,1.38,3.23.74,5.78,1.51,7.64,2.29,3.01,1.27,5.05,3.15,6.1,5.65,1.02,2.59.98,5.2-.13,7.82-1.03,2.45-2.79,4.23-5.28,5.34-1.48.51-3.02.66-4.62.45s-4.55-1.01-8.86-2.41c-13.81-4.47-22.76-7.57-26.84-9.29-2.15-.91-4.1-1.88-5.86-2.93-2.86-1.61-4.81-2.95-5.85-4-1.03-1.05-1.7-2.31-2.02-3.78-.2-1.32-.14-2.37.19-3.16.04-.08.13-.25.28-.5s.26-.46.33-.63c.22-.32.46-.78.71-1.4.41-.85.65-1.93.77-3.22ZM728.4,391.96c-.58.58-1.28,1.83-2.09,3.75-1.8,4.29-2.68,7.88-2.64,10.78.02,1.55.75,2.63,2.18,3.23,1.15.48,2.19.82,3.12,1l4.04.93.73-2.63c1.71-5.87,2.11-10.13,1.2-12.77-1.02-2.79-2.21-4.48-3.57-5.05-1.07-.44-2.07-.19-2.97.76Z" />
+            <path d="M753.94,327.12c6.5-8.3,10.33-13.13,11.5-14.5,2.22-2.59,3.97-4.34,5.26-5.24,1.28-.9,2.86-1.42,4.73-1.57,1.63-.23,3.06.19,4.3,1.25,1.59,1.36,2.07,3.08,1.42,5.15-.19.58-1.69,2.93-4.48,7.03-2.8,4.1-4.32,6.42-4.57,6.95-.51,1.19-1.41,2.79-2.72,4.79-1.25,1.93-1.84,2.92-1.78,2.97.24.2,2.22,1.24,5.93,3.11,3.72,1.87,5.64,2.8,5.76,2.78.36-.07,1.08-1.26,2.15-3.59,1.64-3.34,3.66-6.42,6.06-9.23,1.05-1.22,1.94-2.09,2.67-2.58,2.99-2.06,5.7-2.05,8.12.02,2.13,1.82,2.7,4.26,1.74,7.3-.51,1.31-2.04,4-4.6,8.06-2.62,4.13-3.99,6.39-4.12,6.78,0,.12.17.34.53.64.71.61,1.63,1.21,2.76,1.8.47.28,1.31.81,2.49,1.57,1.19.77,1.99,1.27,2.4,1.49.89.52,1.49.77,1.79.78s.76-.35,1.38-1.07c.74-.86,2.88-4.02,6.43-9.48,2.8-4.35,4.6-6.99,5.4-7.92.37-.43.92-.95,1.66-1.58,3.61-2.65,6.59-2.97,8.95-.95,2.66,2.28,3.02,6.27,1.09,11.99-.96,2.8-2.86,6.48-5.7,11.05-2.84,4.57-5.52,8.33-8.05,11.28-1.42,1.66-2.59,2.78-3.5,3.37-3.42,2.32-6.9,3.52-10.45,3.6-3.01.05-7.39-1.77-13.15-5.45-.95-.56-2.34-1.42-4.18-2.55-1.84-1.14-4.14-2.52-6.9-4.14-2.76-1.61-4.91-2.9-6.46-3.84-8.37-4.93-13.77-8.42-16.2-10.5-1.95-1.67-3.12-3.23-3.51-4.69-.44-2-.52-3.69-.25-5.09.27-1.27.7-2.4,1.29-3.39.62-1,2.21-3.13,4.81-6.4Z" />
+            <path d="M821.33,255.54c1.38-1.38,3.04-2.67,4.99-3.85l.12-.07c5.43-3.3,11.48-3.35,18.13-.15,6.65,3.19,15.15,10.21,25.49,21.03,9.09,9.49,14.24,15.24,15.45,17.23,1.33,2.2,1.65,4.46.95,6.79-.7,2.33-2.1,4.14-4.21,5.42-1.7,1.03-3.65,1.49-5.83,1.36-2.35-.21-4.56-1.03-6.65-2.45-2.08-1.42-5.08-4.17-9-8.25-.69-.76-1.48-1.62-2.39-2.57-.91-.95-1.61-1.64-2.09-2.07l-.61-.73c-.04-.07-.18-.02-.43.12-.97.59-3.73,3.49-8.28,8.71-4.55,5.22-7,7.98-7.37,8.29-1.14,1.06-1.78,1.74-1.92,2.05-.14.31-.03.95.33,1.91,2.46,5.7,3.95,9.63,4.5,11.8.54,2.17.48,4.28-.17,6.31-.57,1.8-1.51,3.1-2.8,3.88-2.84,1.72-5.69,1.31-8.56-1.22-2.34-2.04-5.17-5.78-8.48-11.23-.89-1.46-2.18-3.77-3.87-6.93-8.42-16.99-10.21-31.28-5.36-42.86,1.97-4.82,4.65-9,8.06-12.52ZM835.21,267.99c-1.25-.6-2.04-.81-2.37-.61-.49.29-1.24,1.71-2.26,4.23-1.1,2.58-1.59,5.24-1.48,7.99.08,1.96.38,4.39.92,7.29s1.03,4.72,1.47,5.45c.12.2.22.28.3.23l4.63-6.63c3.13-4.53,5.59-7.34,7.37-8.43.89-.54,1.22-1.01.98-1.41-.36-.6-1.82-1.99-4.36-4.17s-4.27-3.5-5.2-3.94Z" />
+            <path d="M887.5,230.25c1.34-1.82,2.75-2.89,4.23-3.23,1.29-.29,2.8-.07,4.52.65,1.5.62,2.59,1.57,3.27,2.85s1.5,4.05,2.46,8.3c.27,1.21,1.34,6.39,3.21,15.54.82,4.52,1.89,9.66,3.19,15.42.8,3.57,1.31,5.37,1.51,5.4,1.04.32,5.45-.39,13.23-2.14,4.07-.92,7.47-1.81,10.2-2.66,2.63-.83,4.73-1.42,6.31-1.78,3.33-.75,5.95-.54,7.87.62,1.59,1,2.53,2.18,2.84,3.55.24,1.06.14,2.16-.28,3.29-1.52,4.49-7.24,8.21-17.17,11.17-.72.24-2.2.61-4.42,1.12-4.72,1.06-10.08,2.09-16.08,3.09-6,.99-9.6,1.43-10.79,1.3-6.04-.47-9.77-3.85-11.19-10.15-.7-3.11-1.62-9-2.75-17.67s-1.82-15.06-2.06-19.15c-.34-4.95-.38-8.38-.14-10.31.25-1.95.93-3.68,2.04-5.21Z" />
+            <path d="M1022.54,224.14c1.53.09,3.13.32,4.8.68,4.82,1.04,9.23,2.88,13.22,5.53s6.32,5.12,6.99,7.41c.39,1.36.48,2.49.29,3.4-.52,2.44-2.18,3.83-4.97,4.18-1.21.22-2.23.24-3.07.06-.93-.2-3.12-1.07-6.57-2.61-3.27-1.5-5.88-2.46-7.82-2.88-1.39-.3-2.65-.33-3.76-.1-2.11.34-4.48,1.66-7.11,3.96s-4.6,4.66-5.89,7.08c-.54,1.16-1.15,3.29-1.82,6.41l-.64,2.97c-.65,3.91-.85,6.78-.61,8.58s1.15,3.31,2.74,4.53c1.17.89,2.82,1.56,4.95,2.02,2.6.56,5.13.75,7.59.56,4.23-.28,6.42-.76,6.57-1.45.1-.46-1.01-.94-3.33-1.43-3.15-.68-5.63-2.01-7.44-3.99-1.81-1.98-2.49-4-2.05-6.05.25-1.14.91-2.19,1.99-3.15,1.42-1.2,3.56-1.8,6.42-1.78,2.86.02,7.59.66,14.21,1.93l4.45.96c2.78.6,4.8,1.39,6.04,2.37,3.73,2.95,5.1,6.75,4.1,11.38-.11.53-.43,1.54-.94,3.02-1.61,4.35-4.77,7.84-9.46,10.49-4.7,2.65-10.49,4.23-17.39,4.73-5.02.35-9.81.04-14.35-.94-8.72-1.88-15.23-5.66-19.53-11.36-2.72-3.61-4.37-7.9-4.94-12.88-.27-3.24.14-7.41,1.23-12.5,1.11-5.17,2.46-9.17,4.04-12.02,3.52-6,8.26-10.77,14.21-14.3,5.95-3.53,11.9-5.13,17.85-4.81Z" />
+            <path d="M1101.28,249.83c1.26.28,2.76.92,4.48,1.91,1.56.9,2.76,1.77,3.58,2.61,1.25,1.26,2.72,3.44,4.44,6.54,1.71,3.1,2.96,5.87,3.75,8.3,1.84,5.91,1.92,12.61.23,20.07-.94,4.66-2.68,9.18-5.21,13.56-1.4,2.43-2.81,4.3-4.24,5.63-4.76,4.44-10.81,7.09-18.16,7.96s-13.82-.31-19.4-3.54c-.9-.52-1.58-.96-2.04-1.31-1.65-1.13-3.33-2.77-5.04-4.93-3.26-4.22-4.8-9.24-4.61-15.06.19-5.82,2.09-11.86,5.71-18.12,1.6-2.76,3.51-5.51,5.76-8.26,4.96-6.11,10.1-10.51,15.42-13.18,5.33-2.66,10.44-3.39,15.33-2.18ZM1100.09,274.07c-.13-2.05-.56-4.05-1.3-6l-1.17-3.1-1.8,1.12c-3.63,2.3-7.51,7.02-11.63,14.16-2.34,4.04-3.74,6.62-4.22,7.73-.48,1.12-.84,2.55-1.08,4.29-.42,2.99.03,4.87,1.35,5.63.41.24.76.4,1.04.47,1.84.61,4.06.46,6.67-.45,2.61-.92,4.68-2.32,6.22-4.22.63-.71,1.12-1.37,1.47-1.98,1.32-2.29,2.43-5.2,3.32-8.73.89-3.54,1.27-6.51,1.13-8.92Z" />
+            <path d="M1164.05,296.14c1.13.62,2.39,1.65,3.77,3.09,1.25,1.3,2.16,2.47,2.72,3.5.85,1.55,1.66,4.06,2.45,7.52.79,3.45,1.22,6.46,1.3,9.01.13,6.19-1.65,12.64-5.35,19.35-2.2,4.22-5.12,8.08-8.76,11.58-2.02,1.94-3.9,3.35-5.64,4.24-5.8,2.94-12.35,3.81-19.66,2.61s-13.19-4.13-17.66-8.78c-.72-.75-1.25-1.36-1.59-1.82-1.27-1.54-2.43-3.59-3.47-6.14-1.96-4.96-2.05-10.2-.25-15.75,1.79-5.54,5.3-10.82,10.51-15.83,2.3-2.21,4.91-4.32,7.82-6.34,6.46-4.5,12.62-7.29,18.47-8.38,5.87-1.09,10.98-.37,15.34,2.14ZM1156.18,319.1c.44-2,.58-4.05.42-6.13l-.26-3.3-2.04.58c-4.13,1.21-9.16,4.66-15.1,10.37-3.36,3.24-5.43,5.32-6.2,6.26s-1.51,2.21-2.23,3.82c-1.23,2.76-1.32,4.69-.27,5.78.33.34.62.59.87.74,1.59,1.1,3.77,1.57,6.54,1.42,2.76-.16,5.14-.93,7.15-2.33.8-.51,1.46-1.01,1.96-1.49,1.9-1.83,3.77-4.32,5.61-7.46,1.83-3.15,3.02-5.9,3.55-8.26Z" />
+            <path d="M1194.35,348.2c4.34-.26,7.75,2.23,10.21,7.47l.79,1.67c2.82,6.74,4.53,14.72,5.12,23.93s-.11,17.11-2.08,23.69c-4.45,14.67-9.95,23.54-16.5,26.61-2.96,1.39-6.34,1.88-10.14,1.46-7.2-.7-14.59-6.09-22.15-16.17-4.02-5.45-6.98-10.19-8.87-14.23-3.83-8.16-4.15-14.41-.94-18.74,1.34-1.89,2.14-3.31,2.38-4.26.34-1.1,1.17-2.18,2.49-3.21,1.32-1.04,4.31-3.07,8.99-6.11,5.86-3.8,11.24-8.16,16.15-13.09,3.3-3.22,7.27-5.93,11.91-8.11.97-.44,1.85-.76,2.64-.91ZM1195.7,371.93c-.47-2.82-.86-4.57-1.18-5.26-.28-.6-.74-.75-1.37-.45-.7.33-3.37,2.52-7.99,6.58-8.61,7.82-15.16,12.99-19.64,15.52l-4.57,2.62.89,2.73c.09.38.34.99.74,1.85,1.37,2.92,3.55,6.43,6.55,10.52,3,4.1,5.49,6.88,7.47,8.36,2.66,2,5.32,2.38,8,1.12,1.69-.79,3.15-2.16,4.39-4.11,2.47-3.88,4.53-8.73,6.19-14.54,1.93-7.21,2.11-15.52.52-24.94Z" />
+          </g>
+        </svg>
+        <div class="bulb-caption"><span id="ov-bulb-pct" class="bulb-pct">0%</span> of goal</div>
+        <div id="ov-bulb-sub" class="bulb-subcaption">Loading…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast-container" class="toast-container pos-top-right"></div>
+
+<script type="module">
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+(function () {
+  "use strict";
+
+  // ── Config from query params ──────────────────────────────────────────
+
+  var params = new URLSearchParams(window.location.search);
+
+  function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+  var POS_SET = ["top-left", "top-right", "bottom-left", "bottom-right", "center", "hidden"];
+  var TOAST_POS_SET = ["top-left", "top-right", "bottom-left", "bottom-right", "top-center", "bottom-center"];
+
+  var CONFIG = {
+    slug: params.get("slug") || "",
+    supabaseUrl: (params.get("supabaseUrl") || "").replace(/\/$/, ""),
+    supabaseAnonKey: params.get("supabaseAnonKey") || "",
+    bulbPos: POS_SET.indexOf(params.get("bulbPos")) !== -1 ? params.get("bulbPos") : "bottom-right",
+    bulbScale: clamp(parseFloat(params.get("bulbScale")) || 1, 0.5, 2),
+    toastPos: TOAST_POS_SET.indexOf(params.get("toastPos")) !== -1 ? params.get("toastPos") : "top-right",
+    toastDuration: clamp(parseFloat(params.get("toastDuration")) || 6, 3, 15),
+    toastTheme: params.get("toastTheme") === "light" ? "light" : "dark",
+    wiggle: params.get("wiggle") !== "0",
+    debug: params.get("debug") === "1",
+    test: params.get("test") === "1",
+  };
+
+  var debugEl = document.getElementById("ov-debug");
+  function debugLog(msg) {
+    if (!CONFIG.debug) { if (msg) console.log("[overlay]", msg); return; }
+    debugEl.style.display = "block";
+    debugEl.textContent += msg + "\n";
+  }
+
+  // No config at all — likely someone opened the raw file. Never shown
+  // once real params are present, even if one of them is wrong, so a typo
+  // can't put an error card on a live stream.
+  if (!CONFIG.slug && !CONFIG.supabaseUrl && !CONFIG.supabaseAnonKey) {
+    document.getElementById("ov-setup-hint").style.display = "flex";
+    document.getElementById("bulb-anchor").style.display = "none";
+    return;
+  }
+
+  // ── Bulb positioning / scale ─────────────────────────────────────────
+
+  var bulbAnchor = document.getElementById("bulb-anchor");
+  var bulbScaleWrap = document.getElementById("bulb-scale-wrap");
+  var bulbWiggleWrap = document.getElementById("bulb-wiggle-wrap");
+  bulbAnchor.className = "bulb-anchor pos-" + CONFIG.bulbPos;
+  bulbScaleWrap.style.setProperty("--ov-scale", CONFIG.bulbScale);
+
+  function wiggleBulb() {
+    if (!CONFIG.wiggle) return;
+    bulbWiggleWrap.classList.remove("wiggling");
+    // Force reflow so the animation can be re-triggered on back-to-back donations.
+    void bulbWiggleWrap.offsetWidth;
+    bulbWiggleWrap.classList.add("wiggling");
+  }
+  bulbWiggleWrap.addEventListener("animationend", function () {
+    bulbWiggleWrap.classList.remove("wiggling");
+  });
+
+  // ── Bulb liquid-fill geometry (identical to donation-bulb-widget.html) ─
+
+  var GLASS_TOP = 323.59;
+  var GLASS_BOTTOM = 736.47;
+  var WIDTH_SAMPLES = [
+    {o:0.0,w:18.23},{o:7.0,w:107.27},{o:14.0,w:146.06},{o:20.99,w:174.7},
+    {o:27.99,w:197.84},{o:34.99,w:217.3},{o:41.99,w:234.04},{o:48.99,w:248.68},
+    {o:55.98,w:264.4},{o:62.98,w:277.65},{o:69.98,w:288.85},{o:76.98,w:298.36},
+    {o:83.98,w:306.38},{o:90.97,w:313.07},{o:97.97,w:318.53},{o:104.97,w:322.85},
+    {o:111.97,w:326.1},{o:118.97,w:328.33},{o:125.96,w:329.57},{o:132.96,w:329.93},
+    {o:139.96,w:331.47},{o:146.96,w:332.37},{o:153.96,w:332.66},{o:160.95,w:332.33},
+    {o:167.95,w:331.38},{o:174.95,w:329.82},{o:181.95,w:327.64},{o:188.95,w:324.82},
+    {o:195.94,w:321.26},{o:202.94,w:316.92},{o:209.94,w:311.83},{o:216.94,w:306.04},
+    {o:223.93,w:299.62},{o:230.93,w:292.62},{o:237.93,w:285.14},{o:244.93,w:277.24},
+    {o:251.93,w:269.02},{o:258.92,w:260.59},{o:265.92,w:252.03},{o:272.92,w:243.47},
+    {o:279.92,w:235.02},{o:286.92,w:226.78},{o:293.91,w:218.7},{o:300.91,w:210.55},
+    {o:307.91,w:202.49},{o:314.91,w:194.7},{o:321.91,w:187.31},{o:328.9,w:180.46},
+    {o:335.9,w:174.27},{o:342.9,w:168.86},{o:349.9,w:164.38},{o:356.9,w:160.97},
+    {o:363.89,w:158.8},{o:370.89,w:158.07},{o:377.89,w:158.95},{o:384.89,w:159.94},
+    {o:391.89,w:160.02},{o:398.88,w:158.23},{o:405.88,w:151.91},{o:412.88,w:121.94}
+  ];
+
+  function widthAt(offset) {
+    for (var i = 0; i < WIDTH_SAMPLES.length - 1; i++) {
+      var a = WIDTH_SAMPLES[i], b = WIDTH_SAMPLES[i + 1];
+      if (offset >= a.o && offset <= b.o) {
+        var t = (offset - a.o) / (b.o - a.o);
+        return a.w + t * (b.w - a.w);
+      }
+    }
+    return WIDTH_SAMPLES[WIDTH_SAMPLES.length - 1].w;
+  }
+
+  var SAMPLE_COUNT = 300;
+  var GLASS_HEIGHT = GLASS_BOTTOM - GLASS_TOP;
+  var cumulative = [0];
+  for (var i = 1; i <= SAMPLE_COUNT; i++) {
+    cumulative.push(cumulative[i - 1] + widthAt((GLASS_HEIGHT * i) / SAMPLE_COUNT));
+  }
+  var totalArea = cumulative[cumulative.length - 1];
+  for (var j = 0; j < cumulative.length; j++) cumulative[j] = cumulative[j] / totalArea;
+
+  function liquidSurfaceY(fraction) {
+    fraction = Math.max(0, Math.min(1, fraction));
+    for (var i = SAMPLE_COUNT; i >= 1; i--) {
+      var areaFromBottom = 1 - cumulative[i - 1];
+      if (areaFromBottom >= fraction) {
+        var areaPrev = 1 - cumulative[i];
+        var t = (fraction - areaPrev) / (areaFromBottom - areaPrev || 1);
+        var offPrev = (GLASS_HEIGHT * (i - 1)) / SAMPLE_COUNT;
+        var offCur = (GLASS_HEIGHT * i) / SAMPLE_COUNT;
+        return GLASS_TOP + offPrev + t * (offCur - offPrev);
+      }
+    }
+    return GLASS_TOP;
+  }
+
+  var liquidLevelEl = document.getElementById("ov-liquid-level");
+  var pctEl = document.getElementById("ov-bulb-pct");
+  var subEl = document.getElementById("ov-bulb-sub");
+
+  function formatUsd(n) { return "$" + Math.round(n).toLocaleString(); }
+
+  function renderBulb(raisedCents, goalCents) {
+    var fraction = goalCents > 0 ? raisedCents / goalCents : 0;
+    liquidLevelEl.style.transform = "translateY(" + liquidSurfaceY(fraction) + "px)";
+    pctEl.textContent = Math.min(999, Math.round(fraction * 100)) + "%";
+    subEl.textContent = formatUsd(raisedCents / 100) + " raised of " + formatUsd(goalCents / 100);
+  }
+
+  function formatCurrency(amount, currency) {
+    try {
+      return Number(amount).toLocaleString("en-US", {
+        style: "currency", currency: (currency || "usd").toUpperCase(),
+        minimumFractionDigits: 0, maximumFractionDigits: 0,
+      });
+    } catch (e) {
+      return "$" + Math.round(amount);
+    }
+  }
+
+  function escapeHtml(str) {
+    var div = document.createElement("div");
+    div.textContent = str == null ? "" : String(str);
+    return div.innerHTML;
+  }
+
+  // ── Toasts ───────────────────────────────────────────────────────────
+
+  var toastContainer = document.getElementById("toast-container");
+  toastContainer.className = "toast-container pos-" + CONFIG.toastPos;
+
+  var FUN_ICONS = ["🎉", "💚", "✨", "🙌", "🔥"];
+
+  function spawnToast(name, amount, currency, isRecurring) {
+    var toast = document.createElement("div");
+    toast.className = "sb-toast theme-" + CONFIG.toastTheme;
+    var icon = FUN_ICONS[Math.floor(Math.random() * FUN_ICONS.length)];
+    toast.innerHTML =
+      '<div class="sb-toast-icon">' + icon + '</div>' +
+      '<div class="sb-toast-text">' +
+        '<div class="sb-toast-name">' + escapeHtml(name) + '</div>' +
+        '<div class="sb-toast-amount">donated ' + formatCurrency(amount, currency) +
+          (isRecurring ? '<span class="sb-toast-recur" title="Recurring donation">↻ recurring</span>' : '') +
+        '</div>' +
+      '</div>';
+    toastContainer.insertBefore(toast, toastContainer.firstChild);
+
+    // Cap how many are visible at once so a burst of donations doesn't
+    // pile up indefinitely off-screen.
+    while (toastContainer.children.length > 5) {
+      toastContainer.removeChild(toastContainer.lastChild);
+    }
+
+    setTimeout(function () {
+      toast.classList.add("leaving");
+      toast.addEventListener("animationend", function () {
+        if (toast.parentNode) toast.parentNode.removeChild(toast);
+      });
+    }, CONFIG.toastDuration * 1000);
+  }
+
+  // Lets the modal preview (a different origin) trigger a fake toast, and
+  // lets a direct ?test=1 open of this page demo itself with no backend.
+  window.addEventListener("message", function (e) {
+    var data = e.data;
+    if (!data || data.type !== "sb-overlay-test-donation") return;
+    spawnToast(data.name || "Resplendent Capybara", data.amount != null ? data.amount : 20, data.currency || "usd", !!data.recurring);
+    wiggleBulb();
+  });
+
+  if (CONFIG.test) {
+    setTimeout(function () {
+      spawnToast("Magnificent Quokka", 25, "usd", false);
+      wiggleBulb();
+    }, 1200);
+  }
+
+  // ── Live data ────────────────────────────────────────────────────────
+
+  if (!CONFIG.slug || !CONFIG.supabaseUrl || !CONFIG.supabaseAnonKey) {
+    debugLog("Missing slug/supabaseUrl/supabaseAnonKey — bulb will not load live data.");
+    subEl.textContent = "Overlay not fully configured.";
+    return;
+  }
+
+  var campaignId = null;
+
+  function restHeaders() {
+    return { apikey: CONFIG.supabaseAnonKey, Authorization: "Bearer " + CONFIG.supabaseAnonKey };
+  }
+
+  function resolveCampaign() {
+    return fetch(
+      CONFIG.supabaseUrl + "/rest/v1/campaigns?slug=eq." + encodeURIComponent(CONFIG.slug) +
+        "&status=eq.active&select=id",
+      { headers: restHeaders() }
+    )
+      .then(function (res) { if (!res.ok) throw new Error("campaign lookup failed (" + res.status + ")"); return res.json(); })
+      .then(function (rows) {
+        if (!rows.length) throw new Error("campaign not found or not active");
+        campaignId = rows[0].id;
+        debugLog("Resolved campaign_id: " + campaignId);
+      });
+  }
+
+  function refreshProgress() {
+    return fetch(CONFIG.supabaseUrl + "/rest/v1/rpc/campaign_progress", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, restHeaders()),
+      body: JSON.stringify({ p_slugs: [CONFIG.slug] }),
+    })
+      .then(function (res) { if (!res.ok) throw new Error("campaign_progress failed (" + res.status + ")"); return res.json(); })
+      .then(function (rows) {
+        if (!rows.length) return;
+        renderBulb(rows[0].raised_cents, rows[0].goal_cents);
+      });
+  }
+
+  resolveCampaign()
+    .then(refreshProgress)
+    .then(function () {
+      var supabase = createClient(CONFIG.supabaseUrl, CONFIG.supabaseAnonKey);
+      supabase
+        .channel("overlay-donations-" + CONFIG.slug)
+        .on(
+          "postgres_changes",
+          { event: "INSERT", schema: "public", table: "donations", filter: "campaign_id=eq." + campaignId },
+          function (payload) {
+            var row = payload.new || {};
+            debugLog("New donation: " + row.name + " " + row.original_amount + " " + row.original_currency);
+            spawnToast(row.name, row.original_amount, row.original_currency, !!row.stripe_subscription_id);
+            wiggleBulb();
+            refreshProgress();
+          }
+        )
+        .subscribe(function (status) { debugLog("Realtime status: " + status); });
+    })
+    .catch(function (err) {
+      console.error("[overlay]", err);
+      debugLog("Error: " + err.message);
+      subEl.textContent = "Could not load campaign.";
+    });
+})();
+</script>
+</body>
+</html>
