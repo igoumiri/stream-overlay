@@ -11,6 +11,12 @@
      Streamlabs / etc. html/body must stay fully transparent —
      the overlay only ever draws two floating elements on top of
      whatever the stream shows underneath.
+
+     SOUND FILES: any file referenced in SOUND_FILES below (see the
+     "Donation sound" section of the script) must be uploaded to the
+     same GitHub Pages folder as this HTML file, e.g.:
+       /donation-overlay/stream-overlay.html
+       /donation-overlay/locomotive.mp3
      ============================================================ */
   html, body {
     margin: 0;
@@ -141,6 +147,7 @@
   .toast-container.pos-bottom-right  { bottom: 28px; right: 28px; align-items: flex-end; flex-direction: column-reverse; }
   .toast-container.pos-top-center    { top: 28px; left: 50%; transform: translateX(-50%); align-items: center; }
   .toast-container.pos-bottom-center { bottom: 28px; left: 50%; transform: translateX(-50%); align-items: center; flex-direction: column-reverse; }
+  .toast-container.pos-hidden        { display: none; }
 
   .sb-toast {
     display: flex;
@@ -330,7 +337,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
   function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
   var POS_SET = ["top-left", "top-right", "bottom-left", "bottom-right", "center", "hidden"];
-  var TOAST_POS_SET = ["top-left", "top-right", "bottom-left", "bottom-right", "top-center", "bottom-center"];
+  var TOAST_POS_SET = ["top-left", "top-right", "bottom-left", "bottom-right", "top-center", "bottom-center", "hidden"];
+  var SOUND_SET = ["locomotive", "none"];
 
   var CONFIG = {
     slug: params.get("slug") || "",
@@ -341,6 +349,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
     toastPos: TOAST_POS_SET.indexOf(params.get("toastPos")) !== -1 ? params.get("toastPos") : "top-right",
     toastDuration: clamp(parseFloat(params.get("toastDuration")) || 6, 3, 15),
     toastTheme: params.get("toastTheme") === "light" ? "light" : "dark",
+    sound: SOUND_SET.indexOf(params.get("sound")) !== -1 ? params.get("sound") : "locomotive",
     wiggle: params.get("wiggle") !== "0",
     debug: params.get("debug") === "1",
     test: params.get("test") === "1",
@@ -468,6 +477,59 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
     return div.innerHTML;
   }
 
+  // ── Donation sound ───────────────────────────────────────────────────
+  //
+  // Files are expected to sit right next to this HTML file on GitHub
+  // Pages (e.g. locomotive.mp3). Keyed by name so a future sound just
+  // needs an entry here plus a matching <option> in the overlay modal's
+  // "Donation sound" <select> — nothing else has to change.
+  var SOUND_FILES = {
+    locomotive: "locomotive.mp3",
+  };
+
+  var soundFile = SOUND_FILES[CONFIG.sound] || null;
+  var soundAudio = soundFile ? new Audio(soundFile) : null;
+  if (soundAudio) soundAudio.preload = "auto";
+
+  // At most one instance plays at a time; if a new donation arrives while
+  // one is still playing, at most one extra play is queued (rather than
+  // stacking overlapping audio, or letting a burst of donations queue up
+  // minutes of sound). Further arrivals while something is already queued
+  // are simply coalesced into that one pending play.
+  var soundPlaying = false;
+  var soundQueued = false;
+
+  function startSound() {
+    soundPlaying = true;
+    try { soundAudio.currentTime = 0; } catch (e) { /* not seekable yet — fine, play() still works */ }
+    var playPromise = soundAudio.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch(function (err) {
+        // Most likely an autoplay-policy block (no prior user gesture in
+        // this frame) — not fatal, just no sound this time.
+        debugLog("Sound playback failed: " + err.message);
+        soundPlaying = false;
+        soundQueued = false;
+      });
+    }
+  }
+
+  if (soundAudio) {
+    soundAudio.addEventListener("ended", function () {
+      soundPlaying = false;
+      if (soundQueued) {
+        soundQueued = false;
+        startSound();
+      }
+    });
+  }
+
+  function playDonationSound() {
+    if (!soundAudio) return; // CONFIG.sound === "none"
+    if (soundPlaying) { soundQueued = true; return; }
+    startSound();
+  }
+
   // ── Toasts ───────────────────────────────────────────────────────────
 
   var toastContainer = document.getElementById("toast-container");
@@ -476,6 +538,12 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
   var FUN_ICONS = ["🎉", "💚", "✨", "🙌", "🔥"];
 
   function spawnToast(name, amount, currency, isRecurring) {
+    // Toasts (and, per the note in the modal, the sound that goes with
+    // them) are switched off entirely when toastPos is "hidden" — mirrors
+    // how bulbPos: "hidden" turns the bulb off via CSS, except here we
+    // skip building any DOM at all rather than building-then-hiding it.
+    if (CONFIG.toastPos === "hidden") return;
+
     var toast = document.createElement("div");
     toast.className = "sb-toast theme-" + CONFIG.toastTheme;
     var icon = FUN_ICONS[Math.floor(Math.random() * FUN_ICONS.length)];
@@ -488,6 +556,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
         '</div>' +
       '</div>';
     toastContainer.insertBefore(toast, toastContainer.firstChild);
+    playDonationSound();
 
     // Cap how many are visible at once so a burst of donations doesn't
     // pile up indefinitely off-screen.
