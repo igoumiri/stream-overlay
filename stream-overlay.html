@@ -141,12 +141,13 @@
     z-index: 10000;
     pointer-events: none;
   }
-  .toast-container.pos-top-left      { top: 28px; left: 28px; align-items: flex-start; }
-  .toast-container.pos-top-right     { top: 28px; right: 28px; align-items: flex-end; }
-  .toast-container.pos-bottom-left   { bottom: 28px; left: 28px; align-items: flex-start; flex-direction: column-reverse; }
-  .toast-container.pos-bottom-right  { bottom: 28px; right: 28px; align-items: flex-end; flex-direction: column-reverse; }
-  .toast-container.pos-top-center    { top: 28px; left: 50%; transform: translateX(-50%); align-items: center; }
-  .toast-container.pos-bottom-center { bottom: 28px; left: 50%; transform: translateX(-50%); align-items: center; flex-direction: column-reverse; }
+  .toast-container { transition: transform 0.2s ease; }
+  .toast-container.pos-top-left      { top: 28px; left: 28px; align-items: flex-start; transform-origin: top left; transform: scale(var(--ov-toast-scale, 2)); }
+  .toast-container.pos-top-right     { top: 28px; right: 28px; align-items: flex-end; transform-origin: top right; transform: scale(var(--ov-toast-scale, 2)); }
+  .toast-container.pos-bottom-left   { bottom: 28px; left: 28px; align-items: flex-start; flex-direction: column-reverse; transform-origin: bottom left; transform: scale(var(--ov-toast-scale, 2)); }
+  .toast-container.pos-bottom-right  { bottom: 28px; right: 28px; align-items: flex-end; flex-direction: column-reverse; transform-origin: bottom right; transform: scale(var(--ov-toast-scale, 2)); }
+  .toast-container.pos-top-center    { top: 28px; left: 50%; align-items: center; transform-origin: top center; transform: translateX(-50%) scale(var(--ov-toast-scale, 2)); }
+  .toast-container.pos-bottom-center { bottom: 28px; left: 50%; align-items: center; flex-direction: column-reverse; transform-origin: bottom center; transform: translateX(-50%) scale(var(--ov-toast-scale, 2)); }
   .toast-container.pos-hidden        { display: none; }
 
   .sb-toast {
@@ -347,6 +348,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
     bulbPos: POS_SET.indexOf(params.get("bulbPos")) !== -1 ? params.get("bulbPos") : "bottom-right",
     bulbScale: clamp(parseFloat(params.get("bulbScale")) || 1, 0.5, 2),
     toastPos: TOAST_POS_SET.indexOf(params.get("toastPos")) !== -1 ? params.get("toastPos") : "top-right",
+    toastScale: clamp(parseFloat(params.get("toastScale")) || 2, 0.5, 4),
     toastDuration: clamp(parseFloat(params.get("toastDuration")) || 6, 3, 15),
     toastTheme: params.get("toastTheme") === "light" ? "light" : "dark",
     sound: SOUND_SET.indexOf(params.get("sound")) !== -1 ? params.get("sound") : "locomotive",
@@ -534,6 +536,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
   var toastContainer = document.getElementById("toast-container");
   toastContainer.className = "toast-container pos-" + CONFIG.toastPos;
+  toastContainer.style.setProperty("--ov-toast-scale", CONFIG.toastScale);
 
   var FUN_ICONS = ["🎉", "💚", "✨", "🙌", "🔥"];
 
