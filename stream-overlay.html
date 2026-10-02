@@ -119,8 +119,8 @@
 
   @font-face {
     font-family: "RealGoodFont";
-    src: url("https://glitchedstreams.github.io/realgoodaibar/RealGoodFont-Regular.otf") format("opentype"),
-         url("https://glitchedstreams.github.io/realgoodaibar/RealGoodFont-Regular.ttf") format("truetype");
+    src: url("https://igoumiri.github.io/stream-overlay/RealGoodFont-Regular.otf") format("opentype"),
+         url("https://igoumiri.github.io/stream-overlay/RealGoodFont-Regular.ttf") format("truetype");
     font-display: swap;
   }
   .bulb-amount-text {
@@ -318,6 +318,24 @@
 </div>
 
 <div id="toast-container" class="toast-container pos-top-right"></div>
+
+<!-- Early, synchronous placement of the bulb. The main script below is a
+     module that statically imports supabase-js from esm.sh, and a module
+     doesn't execute until that whole import has been fetched — so without
+     this, the bulb paints at the markup's default (bottom-right, 100%)
+     first and only jumps to the configured position/size once the network
+     round-trip finishes. This runs during parsing, before first paint.
+     The main script applies the same values again; that's harmless. -->
+<script>
+(function () {
+  var params = new URLSearchParams(window.location.search);
+  var POS = ["top-left", "top-right", "bottom-left", "bottom-right", "center", "hidden"];
+  var pos = POS.indexOf(params.get("bulbPos")) !== -1 ? params.get("bulbPos") : "bottom-right";
+  var scale = Math.max(0.5, Math.min(2, parseFloat(params.get("bulbScale")) || 1));
+  document.getElementById("bulb-anchor").className = "bulb-anchor pos-" + pos;
+  document.getElementById("bulb-scale-wrap").style.setProperty("--ov-scale", scale);
+})();
+</script>
 
 <script type="module">
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
