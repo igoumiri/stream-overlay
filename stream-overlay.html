@@ -783,7 +783,31 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
           { event: "INSERT", schema: "public", table: "donations", filter: "rollup_campaign_id=eq." + campaignId },
           onDonation
         )
-        .subscribe(function (status) { debugLog("Realtime status: " + status); });
+        // Refunds. A partial refund is an UPDATE (filterable); a full refund deletes
+        // the row, and Postgres realtime can't filter DELETE events, so that listener
+        // is unfiltered. Refunds are rare, so the extra refetches are negligible.
+        // No toast or wiggle: these only resync the bulb.
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "donations", filter: "campaign_id=eq." + campaignId },
+          function () { refreshProgress(); }
+        )
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "donations", filter: "rollup_campaign_id=eq." + campaignId },
+          function () { refreshProgress(); }
+        )
+        .on(
+          "postgres_changes",
+          { event: "DELETE", schema: "public", table: "donations" },
+          function () { refreshProgress(); }
+        )
+        .subscribe(function (status) {
+          debugLog("Realtime status: " + status);
+          // Resync on (re)connect, so donations missed during a dropped
+          // connection still show up. The first SUBSCRIBED is a harmless extra fetch.
+          if (status === "SUBSCRIBED") refreshProgress();
+        });
     })
     .catch(function (err) {
       console.error("[overlay]", err);
