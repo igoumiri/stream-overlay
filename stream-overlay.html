@@ -761,18 +761,27 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
     .then(refreshProgress)
     .then(function () {
       var supabase = createClient(CONFIG.supabaseUrl, CONFIG.supabaseAnonKey);
+      function onDonation(payload) {
+        var row = payload.new || {};
+        debugLog("New donation: " + row.name + " " + row.original_amount + " " + row.original_currency);
+        spawnToast(row.name, row.original_amount, row.original_currency, !!row.stripe_subscription_id);
+        wiggleBulb();
+        refreshProgress();
+      }
+      // Two listeners, one handler: direct donations to this campaign, plus
+      // donations to sub-campaigns that rolled up into it (official campaigns).
+      // A single row can never match both filters for the same campaign.
       supabase
         .channel("overlay-donations-" + CONFIG.slug)
         .on(
           "postgres_changes",
           { event: "INSERT", schema: "public", table: "donations", filter: "campaign_id=eq." + campaignId },
-          function (payload) {
-            var row = payload.new || {};
-            debugLog("New donation: " + row.name + " " + row.original_amount + " " + row.original_currency);
-            spawnToast(row.name, row.original_amount, row.original_currency, !!row.stripe_subscription_id);
-            wiggleBulb();
-            refreshProgress();
-          }
+          onDonation
+        )
+        .on(
+          "postgres_changes",
+          { event: "INSERT", schema: "public", table: "donations", filter: "rollup_campaign_id=eq." + campaignId },
+          onDonation
         )
         .subscribe(function (status) { debugLog("Realtime status: " + status); });
     })
